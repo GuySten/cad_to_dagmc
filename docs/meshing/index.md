@@ -15,7 +15,7 @@ cad_to_dagmc supports two meshing backends for creating surface and volume meshe
 |---------|---------------------|------|
 | Surface mesh (h5m) | Yes | Yes |
 | Volume mesh (vtk) | Yes | Yes |
-| Mesh size control | Tolerances + `target_edge_length` | Full (min/max/per-volume) |
+| Mesh size control | Tolerances + `target_edge_length` | Full (min/max/per-volume, max surface deviation) |
 | Mesh algorithms | 1 (built-in) | 10 algorithms |
 | Parallel meshing | Yes (DAG scheduler) | Yes |
 | Dependencies | Installed with cad_to_dagmc | Requires GMSH |

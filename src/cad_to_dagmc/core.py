@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import math
 import operator
 import tempfile
 import warnings
@@ -1023,6 +1024,104 @@ def init_gmsh():
     return gmsh
 
 
+# Gmsh makes edges up to about 1.4 times the size it is asked for and a
+# triangle's centre sags further than its edges' midpoints, so with edges as
+# long as the longest chord within the deviation (_chord_length) the deviation
+# measured on spheres, cylinders, cones and tori came out at up to 3.3 times
+# the requested one. Halving the size keeps it below the request, at up to 0.82
+# of it.
+_SURFACE_DEVIATION_SIZE_FACTOR = 0.5
+
+# Curvature samples per parametric direction of each curve and surface
+_CURVATURE_SAMPLES = 16
+
+
+def _chord_length(curvature: float, deviation: float) -> float:
+    """The longest chord that stays within deviation of an arc of this curvature.
+
+    A chord of length h across an arc of radius r sits r - sqrt(r**2 - h**2 / 4)
+    from the arc's midpoint, so the longest chord within the deviation d is
+    2 * sqrt(d * (2 * r - d)), about sqrt(8 * d / curvature) when d is small
+    next to r. When d reaches r, no chord deviates by more than d and the
+    diameter is the longest chord, which keeps small radii resolved.
+    """
+    radius = 1 / curvature
+    if deviation >= radius:
+        return 2 * radius
+    return 2 * math.sqrt(deviation * (2 * radius - deviation))
+
+
+def _max_curvature(gmsh, dim: int, tag: int) -> float:
+    """The largest absolute curvature sampled over a curve or surface.
+
+    Samples sit at the centres of a grid over the parametric range rather than
+    on its edges, so a cone apex or similar point of unbounded curvature on the
+    boundary does not set the size for the whole surface.
+    """
+    lower, upper = gmsh.model.getParametrizationBounds(dim, tag)
+    fractions = (np.arange(_CURVATURE_SAMPLES) + 0.5) / _CURVATURE_SAMPLES
+    if dim == 1:
+        u = lower[0] + fractions * (upper[0] - lower[0])
+        curvatures = np.abs(gmsh.model.getCurvature(1, tag, u))
+    else:
+        u = lower[0] + fractions * (upper[0] - lower[0])
+        v = lower[1] + fractions * (upper[1] - lower[1])
+        uv = np.stack(np.meshgrid(u, v), axis=-1).ravel()
+        k_max, k_min = gmsh.model.getPrincipalCurvatures(tag, uv)[:2]
+        curvatures = np.abs(np.concatenate([k_max, k_min]))
+    curvatures = curvatures[np.isfinite(curvatures)]
+    return float(curvatures.max()) if curvatures.size else 0.0
+
+
+def set_surface_deviation_sizes(gmsh, max_surface_deviation: float):
+    """Sizes the mesh so the facets stay within max_surface_deviation of the
+    CAD surface.
+
+    Each curved curve and surface gets the longest edge length that keeps its
+    facets within max_surface_deviation of it at its tightest sampled
+    curvature, so flat faces stay coarse and tightly curved ones are refined.
+    This is the meaning of the cad-to-dagmc-mesher tolerance argument. The
+    sizes are set as a Gmsh background field, which Gmsh combines with the
+    other size settings by taking the smallest.
+
+    Args:
+        gmsh: the gmsh object with the geometry loaded.
+        max_surface_deviation: the largest distance allowed between the
+            facets and the CAD surface, in the units of the (scaled) geometry.
+    """
+    if isinstance(max_surface_deviation, bool) or not isinstance(
+        max_surface_deviation, (int, float)
+    ):
+        raise TypeError(
+            "max_surface_deviation must be a number, "
+            f"got {type(max_surface_deviation).__name__}"
+        )
+    if not max_surface_deviation > 0:
+        raise ValueError(
+            f"max_surface_deviation must be positive, got {max_surface_deviation}"
+        )
+
+    field_ids = []
+    for dim, entities_list in ((1, "CurvesList"), (2, "SurfacesList")):
+        for _, tag in gmsh.model.getEntities(dim):
+            curvature = _max_curvature(gmsh, dim, tag)
+            if curvature <= 0:
+                continue
+            size = _SURFACE_DEVIATION_SIZE_FACTOR * _chord_length(
+                curvature, max_surface_deviation
+            )
+            field_id = gmsh.model.mesh.field.add("Constant")
+            gmsh.model.mesh.field.setNumber(field_id, "VIn", size)
+            gmsh.model.mesh.field.setNumbers(field_id, entities_list, [tag])
+            field_ids.append(field_id)
+
+    if field_ids:
+        min_field = gmsh.model.mesh.field.add("Min")
+        gmsh.model.mesh.field.setNumbers(min_field, "FieldsList", field_ids)
+        gmsh.model.mesh.field.setAsBackgroundMesh(min_field)
+    return gmsh
+
+
 def set_sizes_for_mesh(
     gmsh,
     min_mesh_size: float | None = None,
@@ -1033,6 +1132,7 @@ def set_sizes_for_mesh(
     threads: int = 0,
     *,
     mesh_algorithm_3d: int = 1,
+    max_surface_deviation: float | None = None,
 ):
     """Sets up the mesh sizes for each volume in the mesh.
 
@@ -1052,6 +1152,10 @@ def set_sizes_for_mesh(
         threads: the number of threads for Gmsh to use. Passed into
             gmsh.option.setNumber("General.NumThreads", threads). 0 uses
             all available cores (default), 1 uses a single thread.
+        max_surface_deviation: the largest distance allowed between the
+            surface facets and the CAD surface, in the units of the (scaled)
+            geometry. Refines curved surfaces until the facets are within it,
+            on top of the other size settings. Defaults to None (not used).
 
     Returns:
         The resulting gmsh object and volumes
@@ -1070,6 +1174,9 @@ def set_sizes_for_mesh(
     gmsh.option.setNumber("Mesh.Algorithm", mesh_algorithm)
     gmsh.option.setNumber("Mesh.Algorithm3D", mesh_algorithm_3d)
     gmsh.option.setNumber("General.NumThreads", threads)
+
+    if max_surface_deviation is not None:
+        set_surface_deviation_sizes(gmsh, max_surface_deviation)
 
     if set_size:
         volumes = gmsh.model.getEntities(3)
@@ -1964,6 +2071,7 @@ class CadToDagmc:
         imprint_threads: int | Literal["all"] = "all",
         mesh_algorithm_3d: int = 1,
         volume_mesh_options: dict[str, float | str] | None = None,
+        max_surface_deviation: float | None = None,
     ):
         """Saves a GMesh msh file of the geometry in either 2D surface mesh or
         3D volume mesh.
@@ -2010,6 +2118,11 @@ class CadToDagmc:
                 all volume IDs that have that tag.
             threads: the number of threads for Gmsh to use. 0 uses all
                 available cores (default), 1 uses a single thread.
+            max_surface_deviation: keyword-only, the largest distance allowed
+                between the surface facets and the CAD surface, in the units of
+                the scaled geometry. Curved surfaces are refined until their
+                facets are within it, while flat ones stay as coarse as the
+                other size settings allow. Defaults to None (not used).
         """
 
         resolved_imprint_threads = resolve_imprint(imprint, imprint_threads)
@@ -2056,6 +2169,7 @@ class CadToDagmc:
                 set_size=resolved_set_size,
                 original_set_size=set_size,
                 threads=threads,
+                max_surface_deviation=max_surface_deviation,
             )
 
             if dimensions == 3:
@@ -2156,6 +2270,12 @@ class CadToDagmc:
                 - umesh_filename (str): filename for unstructured mesh (default: 'umesh.vtk')
                 - threads (int): number of threads for Gmsh to use. 0 uses all
                   available cores (default), 1 uses a single thread.
+                - max_surface_deviation (float): the largest distance allowed
+                  between the facets and the CAD surface, in the units of the
+                  scaled geometry, as the cad-to-dagmc-mesher tolerance is.
+                  Curved surfaces are refined until their facets are within
+                  it, while flat ones stay as coarse as min_mesh_size,
+                  max_mesh_size and set_size allow. Default: None (not used).
 
                 For cad-to-dagmc-mesher backend:
 
@@ -2195,6 +2315,7 @@ class CadToDagmc:
             "method",
             "unstructured_volumes",
             "threads",
+            "max_surface_deviation",
         }
         cad_to_dagmc_mesher_keys = {"tolerance", "angular_tolerance", "tet_volumes", "target_edge_length"}
         all_acceptable_keys = gmsh_keys | cad_to_dagmc_mesher_keys | {"meshing_backend", "h5m_backend"}
@@ -2300,6 +2421,7 @@ class CadToDagmc:
         unstructured_volumes = None
         umesh_filename = "umesh.vtk"
         threads = 0
+        max_surface_deviation = None
         tet_data = None
 
         # Extract backend-specific parameters with defaults
@@ -2315,6 +2437,7 @@ class CadToDagmc:
             unstructured_volumes = kwargs.get("unstructured_volumes")
             umesh_filename = kwargs.get("umesh_filename", "umesh.vtk")
             threads = kwargs.get("threads", 0)
+            max_surface_deviation = kwargs.get("max_surface_deviation")
 
             # Warn about unused cad-to-dagmc-mesher parameters
             non_gmsh_params = [
@@ -2415,6 +2538,7 @@ class CadToDagmc:
                     set_size=resolved_set_size,
                     original_set_size=set_size,
                     threads=threads,
+                    max_surface_deviation=max_surface_deviation,
                 )
 
                 gmsh.model.mesh.generate(2)
