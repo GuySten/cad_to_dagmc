@@ -1024,17 +1024,31 @@ def init_gmsh():
     return gmsh
 
 
-# A chord of length h across a curve of curvature k deviates from it by about
-# h**2 * k / 8, so sqrt(8 * deviation / k) is the longest chord within the
-# deviation. Gmsh makes edges up to about 1.4 times the size it is asked for
-# and a triangle's centre sags further than its edges' midpoints, so the
-# deviation measured on spheres, cylinders, cones and tori came out at up to
-# 3.3 times the requested one. Halving the size keeps it below the request,
-# at up to 0.76 of it.
+# Gmsh makes edges up to about 1.4 times the size it is asked for and a
+# triangle's centre sags further than its edges' midpoints, so with edges as
+# long as the longest chord within the deviation (_chord_length) the deviation
+# measured on spheres, cylinders, cones and tori came out at up to 3.3 times
+# the requested one. Halving the size keeps it below the request, at up to 0.82
+# of it.
 _SURFACE_DEVIATION_SIZE_FACTOR = 0.5
 
 # Curvature samples per parametric direction of each curve and surface
 _CURVATURE_SAMPLES = 16
+
+
+def _chord_length(curvature: float, deviation: float) -> float:
+    """The longest chord that stays within deviation of an arc of this curvature.
+
+    A chord of length h across an arc of radius r sits r - sqrt(r**2 - h**2 / 4)
+    from the arc's midpoint, so the longest chord within the deviation d is
+    2 * sqrt(d * (2 * r - d)), about sqrt(8 * d / curvature) when d is small
+    next to r. When d reaches r, no chord deviates by more than d and the
+    diameter is the longest chord, which keeps small radii resolved.
+    """
+    radius = 1 / curvature
+    if deviation >= radius:
+        return 2 * radius
+    return 2 * math.sqrt(deviation * (2 * radius - deviation))
 
 
 def _max_curvature(gmsh, dim: int, tag: int) -> float:
@@ -1093,8 +1107,8 @@ def set_surface_deviation_sizes(gmsh, max_surface_deviation: float):
             curvature = _max_curvature(gmsh, dim, tag)
             if curvature <= 0:
                 continue
-            size = _SURFACE_DEVIATION_SIZE_FACTOR * math.sqrt(
-                8 * max_surface_deviation / curvature
+            size = _SURFACE_DEVIATION_SIZE_FACTOR * _chord_length(
+                curvature, max_surface_deviation
             )
             field_id = gmsh.model.mesh.field.add("Constant")
             gmsh.model.mesh.field.setNumber(field_id, "VIn", size)

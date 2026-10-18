@@ -8,7 +8,7 @@ import pytest
 from test_python_api import get_volumes_and_materials_from_h5m
 
 from cad_to_dagmc import CadToDagmc
-from cad_to_dagmc.core import init_gmsh, set_surface_deviation_sizes
+from cad_to_dagmc.core import _chord_length, init_gmsh, set_surface_deviation_sizes
 
 RADIUS = 10.0
 
@@ -97,6 +97,41 @@ def test_smaller_deviation_refines_only_curved_surfaces(tmp_path):
     assert fine_curved > 5 * coarse_curved
     # flat faces are left to the other size settings, so they are not refined
     assert fine_flat <= 1.1 * coarse_flat
+
+
+@pytest.mark.parametrize("radius, deviation", [(1, 0.001), (1, 0.5), (50, 0.01)])
+def test_chord_length_sags_by_the_deviation(radius, deviation):
+    chord = _chord_length(1 / radius, deviation)
+    sag = radius - np.sqrt(radius**2 - chord**2 / 4)
+    assert sag == pytest.approx(deviation)
+
+
+def test_chord_length_is_about_sqrt_8dr_for_small_deviations():
+    assert _chord_length(1, 1e-6) == pytest.approx(np.sqrt(8e-6), rel=1e-6)
+
+
+@pytest.mark.parametrize("deviation", [1, 3])
+def test_chord_length_is_the_diameter_when_deviation_reaches_the_radius(deviation):
+    assert _chord_length(1, deviation) == 2
+
+
+def test_radius_below_max_surface_deviation_is_still_resolved(tmp_path):
+    """A pin thinner than the deviation keeps its shape, rather than being
+    meshed as coarsely as Gmsh allows."""
+    assembly = cq.Assembly()
+    assembly.add(cq.Workplane().box(20, 20, 20), name="box")
+    assembly.add(cq.Workplane().moveTo(40, 0).sphere(0.5), name="pin")
+    model = CadToDagmc()
+    model.add_cadquery_object(assembly, material_tags=["steel", "water"])
+    msh_file = tmp_path / "mesh.msh"
+    model.export_gmsh_mesh_file(filename=str(msh_file), max_surface_deviation=1.0)
+    deviation, curved, _ = _sphere_deviation_and_triangle_counts(
+        msh_file, np.array([40.0, 0, 0]), 0.5
+    )
+    # sized at half the diameter: about 60 triangles and a tenth of the radius,
+    # where the small-deviation formula gave about 30 and a quarter
+    assert curved > 50
+    assert deviation < 0.1
 
 
 def test_dagmc_h5m_file_with_max_surface_deviation(tmp_path):
