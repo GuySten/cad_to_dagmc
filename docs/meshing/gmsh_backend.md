@@ -41,6 +41,33 @@ model.export_dagmc_h5m_file(
 
 Smaller values = finer mesh = more triangles = slower transport but more accurate geometry.
 
+## Maximum Surface Deviation
+
+`max_surface_deviation` sets the largest distance allowed between the facets
+and the CAD surface, the same meaning as the cad-to-dagmc-mesher `tolerance`.
+Each curved surface and edge is refined until its facets are within that
+distance, while flat faces stay as coarse as the other size settings allow.
+It is in the units of the scaled geometry, so with `scale_factor=0.1` (mm to
+cm) a value of `0.01` is 0.1 mm.
+
+<!--pytest-codeblocks:skip-->
+```python
+model.export_dagmc_h5m_file(
+    filename="dagmc.h5m",
+    meshing_backend="gmsh",
+    max_surface_deviation=0.01,  # facets within 0.01 of the CAD surface
+)
+```
+
+Compared with a single `max_mesh_size`, a large radius gets as many triangles
+as it needs and a small one is not over refined, so the same accuracy needs far
+fewer triangles. It combines with `min_mesh_size`, `max_mesh_size` and
+`set_size`, the smallest size applying at each point, so `max_mesh_size` still
+caps the size of flat faces. Each curve and surface is sized for the tightest
+curvature sampled on it, so a surface whose curvature varies a lot (a B-spline
+surface, or a cone close to its apex) is meshed more finely than it strictly
+needs.
+
 ## Surface Mesh Algorithms
 
 `mesh_algorithm` sets GMSH's `Mesh.Algorithm`, which controls **2D surface
@@ -245,6 +272,7 @@ cad-to-dagmc-mesher backends.
 | `mesh_algorithm_3d` | int | 1 | GMSH 3D volume algorithm: 1 = Delaunay, 10 = HXT |
 | `volume_mesh_options` | dict | None | Numeric/string GMSH options applied after surface meshing, before volume meshing |
 | `set_size` | dict | None | Per-volume mesh sizes |
+| `max_surface_deviation` | float | None | Largest distance between the facets and the CAD surface |
 | `method` | str | "file" | CAD transfer method |
 
 ## See Also
